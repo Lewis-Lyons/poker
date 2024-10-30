@@ -1,0 +1,2 @@
+[console_scripts]
+poker = poker.commands:poker

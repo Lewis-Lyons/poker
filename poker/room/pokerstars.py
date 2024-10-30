@@ -2,6 +2,7 @@ import re
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+import logging
 
 import attr
 import pytz
@@ -15,143 +16,267 @@ from ..hand import Combo
 
 __all__ = ["PokerStarsHandHistory", "Notes"]
 
+# Configure logging
+logging.basicConfig(
+    filename='parser_errors.log',
+    filemode='a',
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.ERROR
+)
 
 @implementer(hh.IStreet)
 class _Street(hh._BaseStreet):
     def _parse_cards(self, boardline):
-        self.cards = (Card(boardline[1:3]), Card(boardline[4:6]), Card(boardline[7:9]))
+        """
+        Parses the boardline to extract community cards.
+        Example boardline: "*** FLOP *** [4c Js 7c]"
+        """
+        match = re.search(r'\[([^\]]+)\]', boardline)
+        if match:
+            card_str = match.group(1).split()
+            self.cards = tuple(Card(cs) for cs in card_str[:3])  # Flop
+            if len(card_str) > 3:
+                self.turn = Card(card_str[3])
+            else:
+                self.turn = None
+            if len(card_str) > 4:
+                self.river = Card(card_str[4])
+            else:
+                self.river = None
+        else:
+            self.cards = ()
+            self.turn = None
+            self.river = None
 
     def _parse_actions(self, actionlines):
+        """
+        Parses action lines within a street.
+        """
         actions = []
         for line in actionlines:
             if line.startswith("Uncalled bet"):
                 action = self._parse_uncalled(line)
             elif "collected" in line:
                 action = self._parse_collected(line)
-            elif "doesn't show hand" in line:
+            elif "doesn't show hand" in line or "mucks" in line:
                 action = self._parse_muck(line)
-            elif ' said, "' in line:  # skip chat lines
+            elif "joins the table" in line:
+                self._handle_player_join(line)
+                continue  # Skip adding to actions
+            elif ' said, "' in line:  # Skip chat lines
                 continue
             elif ":" in line:
                 action = self._parse_player_action(line)
             else:
-                raise RuntimeError("bad action line: " + line)
-
-            actions.append(hh._PlayerAction(*action))
+                logging.error(f"Bad action line: {line}")
+                continue  # Skip bad lines without raising
+            if action:
+                actions.append(hh._PlayerAction(*action))
         self.actions = tuple(actions) if actions else None
 
     def _parse_uncalled(self, line):
-        first_paren_index = line.find("(")
-        second_paren_index = line.find(")")
-        amount = line[first_paren_index + 1 : second_paren_index]
-        name_start_index = line.find("to ") + 3
-        name = line[name_start_index:]
-        return name, Action.RETURN, Decimal(amount)
+        """
+        Parses an 'Uncalled bet' line.
+        Example: "Uncalled bet ($0.40) returned to EsAyy"
+        """
+        try:
+            amount_match = re.search(r'\((\$?\d+(?:\.\d+)?)\)', line)
+            name_match = re.search(r'to (\w+)', line)
+            if amount_match and name_match:
+                amount = Decimal(amount_match.group(1).replace('$', ''))
+                name = name_match.group(1)
+                return name, Action.RETURN, amount
+            else:
+                logging.error(f"Failed to parse Uncalled bet line: {line}")
+                return None
+        except Exception as e:
+            logging.error(f"Error parsing Uncalled bet: {e}, Line: {line}")
+            return None
 
     def _parse_collected(self, line):
-        first_space_index = line.find(" ")
-        name = line[:first_space_index]
-        second_space_index = line.find(" ", first_space_index + 1)
-        third_space_index = line.find(" ", second_space_index + 1)
-        amount = line[second_space_index + 1 : third_space_index]
-        self.pot = Decimal(amount)
-        return name, Action.WIN, self.pot
+        """
+        Parses a 'collected' line.
+        Example: "EsAyy collected $0.37 from pot"
+        """
+        try:
+            match = re.match(r"^(?P<name>\w+) collected \$(?P<amount>\d+(?:\.\d+)?) from pot", line)
+            if match:
+                name = match.group("name")
+                amount = Decimal(match.group("amount"))
+                self.pot = amount
+                return name, Action.WIN, self.pot
+            else:
+                logging.error(f"Failed to parse collected line: {line}")
+                return None
+        except Exception as e:
+            logging.error(f"Error parsing collected line: {e}, Line: {line}")
+            return None
 
     def _parse_muck(self, line):
-        colon_index = line.find(":")
-        name = line[:colon_index]
-        return name, Action.MUCK, None
+        """
+        Parses a 'mucks' line.
+        Example: "PlayerX: doesn't show hand"
+        """
+        try:
+            match = re.match(r"^(?P<name>\w+): (doesn't show hand|mucks)", line)
+            if match:
+                name = match.group("name")
+                return name, Action.MUCK, None
+            else:
+                logging.error(f"Failed to parse muck line: {line}")
+                return None
+        except Exception as e:
+            logging.error(f"Error parsing muck line: {e}, Line: {line}")
+            return None
 
     def _parse_player_action(self, line):
-        name, _, action = line.partition(": ")
-        action, _, amount = action.partition(" ")
-        amount, _, _ = amount.partition(" ")
+        """
+        Parses a player action line.
+        Example: "iskander755: raises $0.10 to $0.15"
+        """
+        try:
+            name, _, action_part = line.partition(": ")
+            action_parts = action_part.split()
+            action = action_parts[0].upper()
 
-        if amount:
-            return name, Action(action), Decimal(amount)
-        else:
-            return name, Action(action), None
+            # Handle actions with multiple words like "ALL-IN"
+            if action == "ALL-IN":
+                mapped_action = Action.ALL_IN
+                amount = None
+            elif action in ["BET", "CALL", "CHECK", "FOLD", "RAISE", "POSTS"]:
+                mapped_action = Action[action]
+                # Extract amount if present
+                if len(action_parts) > 1:
+                    amount_str = action_parts[1].replace('$', '').replace(',', '')
+                    try:
+                        amount = Decimal(amount_str)
+                    except:
+                        amount = None
+                else:
+                    amount = None
+            else:
+                logging.error(f"Unknown action type: {action} in line: {line}")
+                return None
 
+            return name, mapped_action, amount
+        except Exception as e:
+            logging.error(f"Error parsing player action: {e}, Line: {line}")
+            return None
+
+    def _handle_player_join(self, line):
+        """
+        Parses a line where a player joins the table mid-hand.
+        Example: "Hergenschall joins the table at seat #1"
+        """
+        try:
+            match = re.match(r"^(?P<name>.+?) joins the table at seat #(?P<seat>\d+)$", line)
+            if match:
+                name = match.group("name")
+                seat = int(match.group("seat"))
+                # Check if seat is already occupied
+                if self.players[seat - 1].name and self.players[seat - 1].name != "Empty Seat {}".format(seat):
+                    logging.warning(f"Seat {seat} already occupied. Player {name} cannot join.")
+                else:
+                    self.players[seat - 1] = hh._Player(
+                        name=name,
+                        stack=Decimal('0.00'),  # Default stack, adjust as necessary
+                        seat=seat,
+                        combo=None,
+                    )
+                    logging.info(f"Player {name} joined at seat {seat}.")
+            else:
+                logging.error(f"Failed to parse player join line: {line}")
+        except Exception as e:
+            logging.error(f"Error handling player join: {e}, Line: {line}")
 
 @implementer(hh.IHandHistory)
 class PokerStarsHandHistory(hh._SplittableHandHistoryMixin, hh._BaseHandHistory):
-    """Parses PokerStars Tournament hands."""
+    """Parses PokerStars Tournament and Cash game hands."""
 
-    _DATE_FORMAT = "%Y/%m/%d %H:%M:%S ET"
+    _DATE_FORMAT = "%Y/%m/%d %H:%M:%S %Z"
     _TZ = pytz.timezone("US/Eastern")  # ET
-    _split_re = re.compile(r" ?\*\*\* ?\n?|\n")
+    _split_re = re.compile(r"\*\*\*")  # Split sections based on '***'
     _header_re = re.compile(
         r"""
-                        ^PokerStars\s+                                # Poker Room
-                        Hand\s+\#(?P<ident>\d+):\s+                   # Hand history id
-                        (Tournament\s+\#(?P<tournament_ident>\d+),\s+ # Tournament Number
-                         ((?P<freeroll>Freeroll)|(                    # buyin is Freeroll
-                          \$?(?P<buyin>\d+(\.\d+)?)                   # or buyin
-                          (\+\$?(?P<rake>\d+(\.\d+)?))?               # and rake
-                          (\s+(?P<currency>[A-Z]+))?                  # and currency
-                         ))\s+
-                        )?
-                        (?P<game>.+?)\s+                              # game
-                        (?P<limit>(?:Pot\s+|No\s+|)Limit)\s+          # limit
-                        (-\s+Level\s+(?P<tournament_level>\S+)\s+)?   # Level (optional)
-                        \(
-                         (((?P<sb>\d+)/(?P<bb>\d+))|(                 # tournament blinds
-                          \$(?P<cash_sb>\d+(\.\d+)?)/                 # cash small blind
-                          \$(?P<cash_bb>\d+(\.\d+)?)                  # cash big blind
-                          (\s+(?P<cash_currency>\S+))?                # cash currency
-                         ))
-                        \)\s+
-                        -\s+.+?\s+                                    # localized date
-                        \[(?P<date>.+?)\]                             # ET date
-                        """,
+            ^PokerStars\s+                                # Poker Room
+            Hand\s+\#(?P<ident>\d+):\s+                   # Hand history id
+            (Tournament\s+\#(?P<tournament_ident>\d+),\s+ # Tournament Number
+             (?:
+                (?P<freeroll>Freeroll)                   # Freeroll
+                |
+                \$(?P<buyin>\d+(?:\.\d+)?)               # Buyin
+                (?:\+\$(?P<rake>\d+(?:\.\d+)?)?)         # Rake (optional)
+                (?:\s+(?P<currency>[A-Z]+))?            # Currency (optional)
+             )\s+
+            )?
+            (?P<game>.+?)\s+                              # Game
+            (?P<limit>(?:Pot\s+|No\s+|)Limit)\s+          # Limit
+            (?:-\s+Level\s+(?P<tournament_level>\S+)\s+)?   # Level (optional)
+            \(
+             (?:
+                (?P<sb>\d+)/(?P<bb>\d+)                     # Tournament blinds
+                |
+                \$(?P<cash_sb>\d+(?:\.\d+)?)/\$?(?P<cash_bb>\d+(?:\.\d+)?) # Cash blinds
+                (?:\s+(?P<cash_currency>\S+))?               # Cash currency
+             )
+            \)\s+
+            -\s+(?P<date>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} \w{2}) # Date following hyphen
+        """,
         re.VERBOSE,
     )
     _table_re = re.compile(
-        r"^Table '(.*)' (\d+)-max Seat #(?P<button>\d+) is the button"
+        r"^Table '(?P<table_name>.+)' (?P<max_players>\d+)-max Seat #(?P<button>\d+) is the button$"
     )
     _seat_re = re.compile(
-        r"^Seat (?P<seat>\d+): (?P<name>.+?) \(\$?(?P<stack>\d+(\.\d+)?) in chips\)"
-    )  # noqa
-    _hero_re = re.compile(r"^Dealt to (?P<hero_name>.+?) \[(..) (..)\]")
-    _pot_re = re.compile(r"^Total pot (\d+(?:\.\d+)?) .*\| Rake (\d+(?:\.\d+)?)")
-    _winner_re = re.compile(r"^Seat (\d+): (.+?) collected \((\d+(?:\.\d+)?)\)")
-    _showdown_re = re.compile(r"^Seat (\d+): (.+?) showed \[.+?\] and won")
-    _ante_re = re.compile(r".*posts the ante (\d+(?:\.\d+)?)")
-    _board_re = re.compile(r"(?<=[\[ ])(..)(?=[\] ])")
+        r"^Seat (?P<seat>\d+): (?P<name>.+?) \(\$?(?P<stack>\d+(?:\.\d+)?) in chips\)$"
+    )
+    _hero_re = re.compile(r"^Dealt to (?P<hero_name>.+?) \[(?P<card1>.{2}) (?P<card2>.{2})\]$")
+    _pot_re = re.compile(r"^Total pot \$?(?P<pot>\d+(?:\.\d+)?) \| Rake \$?(?P<rake>\d+(?:\.\d+)?)$")
+    _winner_re = re.compile(r"^Seat \d+: (?P<name>.+?) collected \(\$?(?P<amount>\d+(?:\.\d+)?)\)$")
+    _showdown_re = re.compile(r"^Seat \d+: (?P<name>.+?) showed \[.+?\] and won$")
+    _ante_re = re.compile(r".*posts the ante \$?(?P<ante>\d+(?:\.\d+)?)$")
+    _board_re = re.compile(r"\[([^\]]+)\]")
 
     def parse_header(self):
-        # sections[0] is before HOLE CARDS
-        # sections[-1] is before SUMMARY
+        """
+        Parses the header of the hand history.
+        """
+        # Split the raw hand history into sections based on '***'
         self._split_raw()
 
-        match = self._header_re.match(self._splitted[0])
+        # Extract the first line of the header section for regex matching
+        header_section = self._splitted[0].strip().split('\n')[0]
+
+        match = self._header_re.match(header_section)
+        if not match:
+            logging.error("Header does not match expected format.")
+            raise RuntimeError("Header does not match expected format.")
 
         self.extra = dict()
         self.ident = match.group("ident")
 
-        # We cannot use the knowledege of the game type to pick between the blind
-        # and cash blind captures because a cash game play money blind looks exactly
-        # like a tournament blind
+        # Blinds
+        self.sb = Decimal(match.group("sb") or match.group("cash_sb") or '0.00')
+        self.bb = Decimal(match.group("bb") or match.group("cash_bb") or '0.00')
 
-        self.sb = Decimal(match.group("sb") or match.group("cash_sb"))
-        self.bb = Decimal(match.group("bb") or match.group("cash_bb"))
-
+        # Tournament or Cash Game
         if match.group("tournament_ident"):
             self.game_type = GameType.TOUR
             self.tournament_ident = match.group("tournament_ident")
             self.tournament_level = match.group("tournament_level")
 
+            self.buyin = Decimal(match.group("buyin") or '0.00')
+            self.rake = Decimal(match.group("rake") or '0.00')
             currency = match.group("currency")
-            self.buyin = Decimal(match.group("buyin") or 0)
-            self.rake = Decimal(match.group("rake") or 0)
         else:
             self.game_type = GameType.CASH
             self.tournament_ident = None
             self.tournament_level = None
-            currency = match.group("cash_currency")
             self.buyin = None
             self.rake = None
+            currency = match.group("cash_currency")
 
+        # Currency and Money Type
         if match.group("freeroll") and not currency:
             currency = "USD"
 
@@ -160,17 +285,43 @@ class PokerStarsHandHistory(hh._SplittableHandHistoryMixin, hh._BaseHandHistory)
             self.currency = None
         else:
             self.extra["money_type"] = MoneyType.REAL
-            self.currency = Currency(currency)
+            try:
+                self.currency = Currency(currency)
+            except ValueError:
+                logging.error(f"Unknown currency: {currency}")
+                self.currency = None
 
-        self.game = Game(match.group("game"))
-        self.limit = Limit(match.group("limit"))
+        # Game and Limit
+        game_str = match.group("game").upper()
+        try:
+            self.game = Game(game_str)
+        except ValueError:
+            logging.error(f"Unknown game type: {game_str}")
+            self.game = Game.UNKNOWN
 
-        self._parse_date(match.group("date"))
+        limit_str = match.group("limit").upper()
+        try:
+            self.limit = Limit(limit_str.replace(" ", "_"))  # Replace space with underscore if any
+        except ValueError:
+            logging.error(f"Unknown limit type: {limit_str}")
+            self.limit = Limit.UNKNOWN
+
+        # Parse Date
+        date_str = match.group("date")
+        try:
+            naive_date = datetime.strptime(date_str, self._DATE_FORMAT)
+            localized_date = self._TZ.localize(naive_date)
+            self.date = localized_date.astimezone(pytz.UTC)
+        except Exception as e:
+            logging.error(f"Error parsing date: {e}, Date String: {date_str}")
+            self.date = None
 
         self.header_parsed = True
 
     def parse(self):
-        """Parses the body of the hand history, but first parse header if not yet parsed."""
+        """
+        Parses the entire hand history.
+        """
         if not self.header_parsed:
             self.parse_header()
 
@@ -191,270 +342,203 @@ class PokerStarsHandHistory(hh._SplittableHandHistoryMixin, hh._BaseHandHistory)
         self.parsed = True
 
     def _parse_table(self):
-        self._table_match = self._table_re.match(self._splitted[1])
-        self.table_name = self._table_match.group(1)
-        self.max_players = int(self._table_match.group(2))
+        """
+        Parses the table information section.
+        """
+        try:
+            table_section = self.sections.get("HEADER", "").strip().split('\n')[0]
+            match = self._table_re.match(table_section)
+            if not match:
+                logging.error("Table section does not match expected format.")
+                raise RuntimeError("Table section does not match expected format.")
+            self.table_name = match.group("table_name")
+            self.max_players = int(match.group("max_players"))
+        except Exception as e:
+            logging.error(f"Error parsing table section: {e}")
+            raise
 
     def _parse_players(self):
-        self.players = self._init_seats(self.max_players)
-        for line in self._splitted[2:]:
-            match = self._seat_re.match(line)
-            # we reached the end of the players section
-            if not match:
-                break
-            index = int(match.group("seat")) - 1
-            self.players[index] = hh._Player(
-                name=match.group("name"),
-                stack=int(match.group("stack")),
-                seat=int(match.group("seat")),
-                combo=None,
-            )
+        """
+        Parses the players' information.
+        """
+        try:
+            players_section = self.sections.get("HEADER", "").strip().split('\n')[1:]  # Skip the table info line
+            self.players = self._init_seats(self.max_players)
+            for line in players_section:
+                match = self._seat_re.match(line.strip())
+                if not match:
+                    break  # End of players section
+                seat = int(match.group("seat"))
+                name = match.group("name")
+                stack = Decimal(match.group("stack"))
+                self.players[seat - 1] = hh._Player(
+                    name=name,
+                    stack=stack,
+                    seat=seat,
+                    combo=None,
+                )
+        except Exception as e:
+            logging.error(f"Error parsing players section: {e}")
+            raise
 
     def _parse_button(self):
-        button_seat = int(self._table_match.group("button"))
-        self.button = self.players[button_seat - 1]
+        """
+        Identifies the player on the button.
+        """
+        try:
+            button_seat = int(self._table_match.group("button"))
+            self.button = self.players[button_seat - 1]
+        except Exception as e:
+            logging.error(f"Error identifying button: {e}")
+            self.button = None
 
     def _parse_hero(self):
-        hole_cards_line = self._splitted[self._sections[0] + 2]
-        match = self._hero_re.match(hole_cards_line)
-        hero, hero_index = self._get_hero_from_players(match.group("hero_name"))
-        hero.combo = Combo(match.group(2) + match.group(3))
-        self.hero = self.players[hero_index] = hero
-        if self.button.name == self.hero.name:
-            self.button = hero
+        """
+        Parses the hero's hole cards if present.
+        """
+        try:
+            # Search for the "Dealt to" line in the HEADER section
+            preflop_section = self.sections.get("HEADER", "").strip().split('\n')
+            for line in preflop_section:
+                match = self._hero_re.match(line.strip())
+                if match:
+                    hero_name = match.group("hero_name")
+                    card1 = match.group("card1")
+                    card2 = match.group("card2")
+                    hero, hero_index = self._get_hero_from_players(hero_name)
+                    hero.combo = Combo(card1 + card2)
+                    self.hero = self.players[hero_index] = hero
+                    if self.button.name == self.hero.name:
+                        self.button = hero
+                    break
+            else:
+                # If no "Dealt to" line is found, set hero to None or handle accordingly
+                self.hero = None
+        except Exception as e:
+            logging.error(f"Error parsing hero information: {e}")
+            self.hero = None
 
     def _parse_preflop(self):
-        start = self._sections[0] + 3
-        stop = self._sections[1]
-        self.preflop_actions = tuple(self._splitted[start:stop])
+        """
+        Parses preflop actions.
+        """
+        try:
+            preflop_section = self.sections.get("HOLE_CARDS", "").strip().split('\n')[1:]  # Skip 'HOLE CARDS' line
+            preflop_actions = []
+            for line in preflop_section:
+                if line.upper().startswith("***"):
+                    break
+                preflop_actions.append(line.strip())
+            self.preflop_actions = tuple(preflop_actions) if preflop_actions else None
+        except Exception as e:
+            logging.error(f"Error parsing preflop actions: {e}")
+            self.preflop_actions = None
 
     def _parse_flop(self):
+        """
+        Parses the flop section.
+        """
         try:
-            start = self._splitted.index("FLOP") + 1
-        except ValueError:
+            if "FLOP" not in self.sections:
+                self.flop = None
+                return
+            flop_section = self.sections["FLOP"]
+            self.flop = _Street(flop_section.strip().split('\n'))
+        except Exception as e:
+            logging.error(f"Error parsing flop section: {e}")
             self.flop = None
-            return
-        stop = self._splitted.index("", start)
-        floplines = self._splitted[start:stop]
-        self.flop = _Street(floplines)
 
     def _parse_street(self, street):
+        """
+        Parses a given street (turn or river).
+        """
         try:
-            start = self._splitted.index(street.upper()) + 2
-            stop = self._splitted.index("", start)
-            street_actions = self._splitted[start:stop]
-            setattr(
-                self,
-                f"{street.lower()}_actions",
-                tuple(street_actions) if street_actions else None,
-            )
-        except ValueError:
-            setattr(self, street, None)
+            street_key = street.upper()
+            if street_key not in self.sections:
+                setattr(self, f"{street.lower()}_actions", None)
+                return
+            street_section = self.sections[street_key].strip().split('\n')
+            street_obj = _Street(street_section)
+            setattr(self, f"{street.lower()}_actions", street_obj.actions)
+        except Exception as e:
+            logging.error(f"Error parsing {street} section: {e}")
             setattr(self, f"{street.lower()}_actions", None)
 
     def _parse_showdown(self):
-        self.show_down = "SHOW DOWN" in self._splitted
+        """
+        Parses the showdown section.
+        """
+        try:
+            self.show_down = "SHOW_DOWN" in self.sections
+        except Exception as e:
+            logging.error(f"Error parsing showdown: {e}")
+            self.show_down = False
 
     def _parse_pot(self):
-        potline = self._splitted[self._sections[-1] + 2]
-        match = self._pot_re.match(potline)
-        self.total_pot = int(match.group(1))
+        """
+        Parses the total pot and rake from the summary section.
+        """
+        try:
+            if "SUMMARY" not in self.sections:
+                self.total_pot = Decimal('0.00')
+                self.rake = Decimal('0.00')
+                return
+            summary_section = self.sections["SUMMARY"].strip().split('\n')
+            for line in summary_section:
+                match = self._pot_re.match(line.strip())
+                if match:
+                    self.total_pot = Decimal(match.group("pot"))
+                    self.rake = Decimal(match.group("rake"))
+                    break
+            else:
+                # If no pot line is found, set to 0
+                self.total_pot = Decimal('0.00')
+                self.rake = Decimal('0.00')
+        except Exception as e:
+            logging.error(f"Error parsing pot information: {e}")
+            self.total_pot = Decimal('0.00')
+            self.rake = Decimal('0.00')
 
     def _parse_board(self):
-        boardline = self._splitted[self._sections[-1] + 3]
-        if not boardline.startswith("Board"):
-            return
-        cards = self._board_re.findall(boardline)
-        self.turn = Card(cards[3]) if len(cards) > 3 else None
-        self.river = Card(cards[4]) if len(cards) > 4 else None
+        """
+        Parses the board cards from the summary section.
+        """
+        try:
+            if "SUMMARY" not in self.sections:
+                self.board = None
+                return
+            summary_section = self.sections["SUMMARY"].strip().split('\n')
+            for line in summary_section:
+                match = self._board_re.search(line)
+                if match:
+                    cards = match.group(1).split()
+                    self.board = tuple(Card(card) for card in cards)
+                    break
+            else:
+                self.board = None
+        except Exception as e:
+            logging.error(f"Error parsing board cards: {e}")
+            self.board = None
 
     def _parse_winners(self):
-        winners = set()
-        start = self._sections[-1] + 4
-        for line in self._splitted[start:]:
-            if not self.show_down and "collected" in line:
-                match = self._winner_re.match(line)
-                winners.add(match.group(2))
-            elif self.show_down and "won" in line:
-                match = self._showdown_re.match(line)
-                winners.add(match.group(2))
-
-        self.winners = tuple(winners)
-
-
-@attr.s(slots=True)
-class _Label:
-    """Labels in Player notes."""
-
-    id = attr.ib()
-    color = attr.ib()
-    name = attr.ib()
-
-
-@attr.s(slots=True)
-class _Note:
-    """Player note."""
-
-    player = attr.ib()
-    label = attr.ib()
-    update = attr.ib()
-    text = attr.ib()
-
-
-class NoteNotFoundError(ValueError):
-    """Note not found for player."""
-
-
-class LabelNotFoundError(ValueError):
-    """Label not found in the player notes."""
-
-
-class Notes:
-    """Class for parsing pokerstars XML notes."""
-
-    _color_re = re.compile("^[0-9A-F]{6}$")
-
-    def __init__(self, notes: str):
-        self.raw = notes
-        parser = etree.XMLParser(recover=True, resolve_entities=False)
-        self.root = etree.XML(notes.encode(), parser)
-
-    def __str__(self):
-        return etree.tostring(
-            self.root, xml_declaration=True, encoding="UTF-8", pretty_print=True
-        ).decode()
-
-    @classmethod
-    def from_file(cls, filename):
-        """Make an instance from a XML file."""
-        return cls(Path(filename).open().read())
-
-    @property
-    def players(self):
-        """Tuple of player names."""
-        return tuple(note.get("player") for note in self.root.iter("note"))
-
-    @property
-    def label_names(self):
-        """Tuple of label names."""
-        return tuple(label.text for label in self.root.iter("label"))
-
-    @property
-    def notes(self):
-        """Tuple of notes.."""
-        return tuple(self._get_note_data(note) for note in self.root.iter("note"))
-
-    @property
-    def labels(self):
-        """Tuple of labels."""
-        return tuple(
-            _Label(label.get("id"), label.get("color"), label.text)
-            for label in self.root.iter("label")
-        )
-
-    def get_note_text(self, player):
-        """Return note text for the player."""
-        note = self._find_note(player)
-        return note.text
-
-    def get_note(self, player):
-        """Return :class:`_Note` tuple for the player."""
-        return self._get_note_data(self._find_note(player))
-
-    def add_note(self, player, text, label=None, update=None):
-        """Add a note to the xml. If update param is None, it will be the current time."""
-        if label is not None and (label not in self.label_names):
-            raise LabelNotFoundError(f"Invalid label: {label}")
-        if update is None:
-            update = datetime.now(pytz.utc)
-        # converted to timestamp, rounded to ones
-        update = update.strftime("%s")
-        label_id = self._get_label_id(label)
-        new_note = etree.Element("note", player=player, label=label_id, update=update)
-        new_note.text = text
-        self.root.append(new_note)
-
-    def append_note(self, player, text):
-        """Append text to an already existing note."""
-        note = self._find_note(player)
-        note.text += text
-
-    def prepend_note(self, player, text):
-        """Prepend text to an already existing note."""
-        note = self._find_note(player)
-        note.text = text + note.text
-
-    def replace_note(self, player, text):
-        """Replace note text with text. (Overwrites previous note!)"""
-        note = self._find_note(player)
-        note.text = text
-
-    def change_note_label(self, player, label):
-        label_id = self._get_label_id(label)
-        note = self._find_note(player)
-        note.attrib["label"] = label_id
-
-    def del_note(self, player):
-        """Delete a note by player name."""
-        self.root.remove(self._find_note(player))
-
-    def _find_note(self, player):
-        # if player name contains a double quote, the search phrase would be invalid.
-        # &quot; entitiy is searched with ", e.g. &quot;bootei&quot; is searched with '"bootei"'
-        quote = "'" if '"' in player else '"'
-        note = self.root.find(f"note[@player={quote}{player}{quote}]")
-        if note is None:
-            raise NoteNotFoundError(player)
-        return note
-
-    def _get_note_data(self, note):
-        labels = {label.get("id"): label.text for label in self.root.iter("label")}
-        label = note.get("label")
-        label = labels[label] if label != "-1" else None
-        timestamp = note.get("update")
-        if timestamp:
-            timestamp = int(timestamp)
-            update = datetime.fromtimestamp(timestamp, pytz.UTC)
-        else:
-            update = None
-        return _Note(note.get("player"), label, update, note.text)
-
-    def get_label(self, name):
-        """Find the label by name."""
-        label_tag = self._find_label(name)
-        return _Label(label_tag.get("id"), label_tag.get("color"), label_tag.text)
-
-    def add_label(self, name, color):
-        """Add a new label. It's id will automatically be calculated."""
-        color_upper = color.upper()
-        if not self._color_re.match(color_upper):
-            raise ValueError(f"Invalid color: {color}")
-
-        labels_tag = self.root[0]
-        last_id = int(labels_tag[-1].get("id"))
-        new_id = str(last_id + 1)
-
-        new_label = etree.Element("label", id=new_id, color=color_upper)
-        new_label.text = name
-
-        labels_tag.append(new_label)
-
-    def del_label(self, name):
-        """Delete a label by name."""
-        labels_tag = self.root[0]
-        labels_tag.remove(self._find_label(name))
-
-    def _find_label(self, name):
-        labels_tag = self.root[0]
+        """
+        Parses the winners from the summary section.
+        """
         try:
-            return labels_tag.xpath('label[text()="%s"]' % name)[0]
-        except IndexError:
-            raise LabelNotFoundError(name)
-
-    def _get_label_id(self, name):
-        return self._find_label(name).get("id") if name else "-1"
-
-    def save(self, filename):
-        """Save the note XML to a file."""
-        with open(filename, "w") as fp:
-            fp.write(str(self))
+            if "SUMMARY" not in self.sections:
+                self.winners = ()
+                return
+            summary_section = self.sections["SUMMARY"].strip().split('\n')
+            winners = set()
+            for line in summary_section:
+                match = self._winner_re.match(line.strip())
+                if match:
+                    winners.add(match.group("name"))
+                else:
+                    match_showdown = self._showdown_re.match(line.strip())
+                    if match_showdown:
+                        winners.add(match_showdown.group("name"))
+            self.winners = tuple(winners) if winners else ()
+        except Exception as e:
+            logging.error(f"Error parsing winners: {e}")
+            self.winners = ()
